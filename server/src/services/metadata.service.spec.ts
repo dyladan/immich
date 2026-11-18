@@ -10,6 +10,7 @@ import {
   AssetType,
   AssetVisibility,
   ChecksumAlgorithm,
+  DatabaseLock,
   ExifOrientation,
   ImmichWorker,
   JobName,
@@ -186,6 +187,90 @@ describe(MetadataService.name, () => {
       await sut.handleMetadataExtraction({ id: 'non-existent' });
 
       expect(mocks.assetJob.getForMetadataExtraction).toHaveBeenCalledWith('non-existent');
+      expect(mocks.asset.upsertExif).not.toHaveBeenCalled();
+      expect(mocks.asset.update).not.toHaveBeenCalled();
+    });
+
+    it('should not look for a move when the files are still in place', async () => {
+      const asset = AssetFactory.create();
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValue(getForMetadataExtraction(asset));
+      mocks.storage.checkFileExists.mockResolvedValue(true);
+
+      await sut.handleMetadataExtraction({ id: asset.id });
+
+      expect(mocks.assetJob.getForMetadataExtraction).toHaveBeenCalledTimes(1);
+      expect(mocks.database.withLock).not.toHaveBeenCalled();
+      expect(mocks.asset.upsertExif).toHaveBeenCalled();
+    });
+
+    it('should read the metadata again if the asset was moved by the storage template migration', async () => {
+      const uploaded = AssetFactory.create({ type: AssetType.Video, originalPath: '/data/upload/user/video.mov' });
+      const migrated = { ...uploaded, originalPath: '/data/library/user/2022/video.mov' };
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValueOnce(getForMetadataExtraction(uploaded));
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValueOnce(getForMetadataExtraction(migrated));
+      mocks.storage.stat.mockRejectedValueOnce(new Error('ENOENT: no such file or directory'));
+      mocks.media.probe.mockRejectedValueOnce(new Error('ffprobe exited with code 1'));
+      mocks.media.probe.mockResolvedValue(videoInfoStub.videoStreamVertical2160p);
+      mocks.storage.checkFileExists.mockImplementation((path) => Promise.resolve(path === migrated.originalPath));
+      mocks.metadata.readTags.mockResolvedValue({});
+
+      await sut.handleMetadataExtraction({ id: uploaded.id });
+
+      expect(mocks.database.withLock).toHaveBeenCalledWith(DatabaseLock.StorageTemplateMigration, expect.any(Function));
+      expect(mocks.media.probe).toHaveBeenLastCalledWith(migrated.originalPath);
+      expect(mocks.storage.stat).toHaveBeenLastCalledWith(migrated.originalPath);
+      expect(mocks.asset.upsertExif).toHaveBeenCalledWith(
+        expect.objectContaining({ exif: expect.objectContaining({ assetId: uploaded.id, fileSizeInByte: 123_456 }) }),
+      );
+    });
+
+    it('should read the metadata again if the sidecar was moved by the storage template migration', async () => {
+      const uploaded = AssetFactory.from({ originalPath: '/data/upload/user/image.jpg' })
+        .file({ type: AssetFileType.Sidecar, path: '/data/upload/user/image.jpg.xmp' })
+        .build();
+      const migrated = AssetFactory.from({ id: uploaded.id, originalPath: '/data/library/user/2022/image.jpg' })
+        .file({ type: AssetFileType.Sidecar, path: '/data/library/user/2022/image.jpg.xmp' })
+        .build();
+      const sidecarDate = new Date('2022-01-01T00:00:00.000Z');
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValueOnce(getForMetadataExtraction(uploaded));
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValueOnce(getForMetadataExtraction(migrated));
+      mocks.storage.checkFileExists.mockImplementation((path) => Promise.resolve(path.startsWith('/data/library/')));
+      // the first read fails without throwing because the files are already gone
+      mocks.metadata.readTags.mockReset();
+      mocks.metadata.readTags.mockImplementation((path) =>
+        Promise.resolve(
+          path === '/data/library/user/2022/image.jpg.xmp' ? { CreationDate: sidecarDate.toISOString() } : {},
+        ),
+      );
+
+      await sut.handleMetadataExtraction({ id: uploaded.id });
+
+      expect(mocks.metadata.readTags).toHaveBeenCalledWith('/data/library/user/2022/image.jpg.xmp');
+      expect(mocks.asset.upsertExif).toHaveBeenCalledWith(
+        expect.objectContaining({ exif: expect.objectContaining({ dateTimeOriginal: sidecarDate }) }),
+      );
+    });
+
+    it('should fail if the file is missing and the asset was not moved', async () => {
+      const asset = AssetFactory.create();
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValue(getForMetadataExtraction(asset));
+      mocks.storage.stat.mockRejectedValue(new Error('ENOENT: no such file or directory'));
+      mocks.storage.checkFileExists.mockResolvedValue(false);
+
+      await expect(sut.handleMetadataExtraction({ id: asset.id })).rejects.toThrow('ENOENT');
+
+      expect(mocks.storage.stat).toHaveBeenCalledTimes(1);
+      expect(mocks.asset.upsertExif).not.toHaveBeenCalled();
+    });
+
+    it('should stop if the asset was deleted while its metadata was being read', async () => {
+      const asset = AssetFactory.create();
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValueOnce(getForMetadataExtraction(asset));
+      mocks.assetJob.getForMetadataExtraction.mockResolvedValueOnce(void 0);
+      mocks.storage.stat.mockRejectedValue(new Error('ENOENT: no such file or directory'));
+
+      await sut.handleMetadataExtraction({ id: asset.id });
+
       expect(mocks.asset.upsertExif).not.toHaveBeenCalled();
       expect(mocks.asset.update).not.toHaveBeenCalled();
     });

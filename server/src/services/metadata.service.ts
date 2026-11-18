@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ContainerDirectoryItem, ExifDateTime, Tags } from 'exiftool-vendored';
 import { Insertable } from 'kysely';
-import { isUndefined, omitBy, pick } from 'lodash-es';
+import { isEqual, isUndefined, omitBy, pick } from 'lodash-es';
 import { DateTime, Duration } from 'luxon';
 import { Stats } from 'node:fs';
 import { constants } from 'node:fs/promises';
@@ -39,6 +39,7 @@ import { Tasks } from 'src/utils/tasks.js';
 
 const POSTGRES_INT_MAX = 2_147_483_647;
 const POSTGRES_INT_MIN = -2_147_483_648;
+const METADATA_READ_ATTEMPTS = 3;
 
 /** look for a date from these tags (in order) */
 const EXIF_DATE_TAGS: Array<keyof ImmichTags> = [
@@ -227,19 +228,16 @@ export class MetadataService extends BaseService {
 
   @OnJob({ name: JobName.AssetExtractMetadata, queue: QueueName.MetadataExtraction })
   async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) {
-    const [{ metadata, reverseGeocoding }, asset] = await Promise.all([
+    const [{ metadata, reverseGeocoding }, extraction] = await Promise.all([
       this.getConfig({ withCache: true }),
-      this.assetJobRepository.getForMetadataExtraction(data.id),
+      this.readAssetMetadata(data.id),
     ]);
 
-    if (!asset) {
+    if (!extraction) {
       return;
     }
 
-    const [exifResult, stats] = await Promise.all([
-      this.getExifTags(asset),
-      this.storageRepository.stat(asset.originalPath),
-    ]);
+    const { asset, exifResult, stats } = extraction;
     const { tags: exifTags, audio, video, packets, format } = exifResult;
     this.logger.verbose('Exif Tags', exifTags);
 
@@ -567,6 +565,64 @@ export class MetadataService extends BaseService {
       [width, height] = [exifTags.ImageWidth, exifTags.ImageHeight];
     }
     return { width, height };
+  }
+
+  // Reads the metadata of an asset from disk.
+  //
+  // The storage template migration can move the original file and its sidecar while they are being read.
+  // For example, the motion video of a live photo is moved as soon as the still image has been extracted,
+  // even if the extraction of the video itself is still running. If the files are no longer where the
+  // asset said they were, wait for the move to finish and read them again from their new location.
+  private async readAssetMetadata(id: string) {
+    let asset = await this.assetJobRepository.getForMetadataExtraction(id);
+
+    for (let attempt = 1; asset; attempt++) {
+      const paths = this.getMetadataPaths(asset);
+      const [result] = await Promise.allSettled([
+        Promise.all([this.getExifTags(asset), this.storageRepository.stat(asset.originalPath)]),
+      ]);
+
+      // a failed read of the tags only logs a warning, so also check a successful result
+      if (result.status === 'fulfilled' && (await this.isOnDisk(paths))) {
+        const [exifResult, stats] = result.value;
+        return { asset, exifResult, stats };
+      }
+
+      if (attempt < METADATA_READ_ATTEMPTS) {
+        // a move holds this lock until the new path is saved
+        const latest = await this.databaseRepository.withLock(DatabaseLock.StorageTemplateMigration, () =>
+          this.assetJobRepository.getForMetadataExtraction(id),
+        );
+        if (!latest) {
+          return;
+        }
+
+        if (!isEqual(this.getMetadataPaths(latest), paths)) {
+          this.logger.debug(
+            `Asset ${id} was moved while reading its metadata, reading it again: ${latest.originalPath}`,
+          );
+          asset = latest;
+          continue;
+        }
+      }
+
+      if (result.status === 'rejected') {
+        throw result.reason;
+      }
+
+      const [exifResult, stats] = result.value;
+      return { asset, exifResult, stats };
+    }
+  }
+
+  private getMetadataPaths(asset: { originalPath: string; files: AssetFile[] }) {
+    const { sidecarFile } = getAssetFiles(asset.files);
+    return sidecarFile ? [asset.originalPath, sidecarFile.path] : [asset.originalPath];
+  }
+
+  private async isOnDisk(paths: string[]) {
+    const results = await Promise.all(paths.map((path) => this.storageRepository.checkFileExists(path)));
+    return results.every(Boolean);
   }
 
   private async getExifTags(asset: { originalPath: string; files: AssetFile[]; type: AssetType }) {
